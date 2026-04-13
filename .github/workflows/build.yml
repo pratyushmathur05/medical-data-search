@@ -1,0 +1,34 @@
+name: Build Windows Executable
+
+on: [push, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pyinstaller google-genai pillow
+
+    - name: Inject Secret API Key
+      # This securely creates the config.py file ONLY on the temporary build server
+      run: echo "GEMINI_API_KEY = '${{ secrets.GEMINI_API_KEY }}'" > config.py
+
+    - name: Build EXE with PyInstaller
+      run: pyinstaller --onefile --windowed medisearch.py
+
+    - name: Upload EXE
+      uses: actions/upload-artifact@v4
+      with:
+        name: MediSearch-Windows-App
+        path: dist/medisearch.exe

@@ -1,14 +1,21 @@
 import csv
 import random
 import webbrowser
-import base64
-import os
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, simpledialog
-from pathlib import Path
 import threading
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+from pathlib import Path
 
-
+# --- NEW IMPORTS FOR AI OCR ---
+from google import genai
+import PIL.Image
+import os
+try:
+    import config
+    my_api_key = config.GEMINI_API_KEY
+except ImportError:
+    my_api_key = "MISSING_KEY"
+client = genai.Client(api_key=my_api_key)
 # ─────────────────────────────────────────────
 #  DATA LOGIC
 # ─────────────────────────────────────────────
@@ -23,7 +30,7 @@ def load_data(file_path):
         return data
     except FileNotFoundError:
         return None
-    except Exception:
+    except Exception as e:
         return None
 
 
@@ -147,385 +154,6 @@ FONT_MONO   = ("Consolas", 11)
 
 
 # ─────────────────────────────────────────────
-#  PRESCRIPTION EXTRACTION - MULTIPLE OPTIONS
-# ─────────────────────────────────────────────
-
-# API OPTIONS with pros/cons
-API_OPTIONS = {
-    "tesseract_ocr": {
-        "name": "Tesseract OCR (LOCAL - FREE)",
-        "cost": "FREE",
-        "description": "Runs entirely on your computer. No API key needed.",
-        "setup": "pip install pytesseract pillow\n(Also install Tesseract from: https://github.com/UB-Mannheim/tesseract/wiki)",
-    },
-    "paddleocr": {
-        "name": "PaddleOCR (LOCAL - FREE)",
-        "cost": "FREE",
-        "description": "Fast, accurate OCR. Works offline. No API key needed.",
-        "setup": "pip install paddleocr pillow",
-    },
-    "easyocr": {
-        "name": "EasyOCR (LOCAL - FREE)",
-        "cost": "FREE",
-        "description": "Multi-language support. Runs on your computer. No API key needed.",
-        "setup": "pip install easyocr pillow torch",
-    },
-    "azure_free": {
-        "name": "Azure Computer Vision (FREE TIER)",
-        "cost": "FREE (up to 20 requests/min)",
-        "description": "5000 free calls/month. Requires Azure account.",
-        "setup": "Get free key from: portal.azure.com (create Cognitive Services resource)",
-    },
-    "aws_rekognition": {
-        "name": "AWS Rekognition (FREE TIER)",
-        "cost": "FREE (12 months, then $0.001/image)",
-        "description": "Excellent accuracy. AWS free tier included.",
-        "setup": "Create AWS account + install: pip install boto3",
-    },
-    "ibm_vision": {
-        "name": "IBM Cloud Vision (FREE TIER)",
-        "cost": "FREE (up to 250 requests/month)",
-        "description": "Good for text extraction from documents.",
-        "setup": "Get free key from: cloud.ibm.com",
-    },
-}
-
-
-def extract_with_tesseract(image_path: str) -> list[str]:
-    """Extract medicine names using Tesseract OCR (runs locally)."""
-    try:
-        from PIL import Image
-        import pytesseract 
-    except ImportError:
-        raise RuntimeError(
-            "Tesseract not installed.\n\n"
-            "Install with:\n"
-            "1. pip install pytesseract pillow\n"
-            "2. Download Tesseract from:\n"
-            "   https://github.com/UB-Mannheim/tesseract/wiki\n"
-            "3. Run the installer"
-        )
-    
-    try:
-        img = Image.open(image_path)
-        text = pytesseract.image_to_string(img)
-        
-        if not text.strip():
-            return []
-        
-        # Extract medicine names (one per line, filter empty/short lines)
-        medicines = [line.strip(" -•*1234567890.)") for line in text.splitlines()
-                    if len(line.strip(" -•*1234567890.)")) > 2]
-        return [m for m in medicines if m]
-    except Exception as e:
-        raise RuntimeError(f"Tesseract error:\n{str(e)}")
-
-
-def extract_with_paddleocr(image_path: str) -> list[str]:
-    """Extract medicine names using PaddleOCR (runs locally)."""
-    try:
-        from paddleocr import PaddleOCR
-    except ImportError:
-        raise RuntimeError(
-            "PaddleOCR not installed.\n\n"
-            "Install with:\n"
-            "pip install paddleocr pillow\n\n"
-            "First run will download ~500MB of models (one-time)."
-        )
-    
-    try:
-        ocr = PaddleOCR(use_angle_cls=True, lang='en', use_gpu=False, enable_mkldnn=False)
-        result = ocr.predict(image_path, det=True, rec=True)
-        
-        if not result or not result[0]:
-            return []
-        
-        # Extract text from results
-        medicines = []
-        for line in result:
-            for word_info in line:
-                text = word_info[1][0]
-                text = text.strip(" -•*1234567890.)")
-                if len(text) > 2:
-                    medicines.append(text)
-        
-        return medicines
-    except Exception as e:
-        raise RuntimeError(f"PaddleOCR error:\n{str(e)}")
-
-
-def extract_with_easyocr(image_path: str) -> list[str]:
-    """Extract medicine names using EasyOCR (runs locally)."""
-    try:
-        import easyocr
-    except ImportError:
-        raise RuntimeError(
-            "EasyOCR not installed.\n\n"
-            "Install with:\n"
-            "pip install easyocr pillow torch\n\n"
-            "First run will download ~200MB of models (one-time)."
-        )
-    
-    try:
-        reader = easyocr.Reader(['en'])
-        result = reader.readtext(image_path)
-        
-        if not result:
-            return []
-        
-        medicines = []
-        for detection in result:
-            text = detection[1]
-            confidence = detection[2]
-            if confidence > 0.3:  # Filter low confidence
-                text = text.strip(" -•*1234567890.)")
-                if len(text) > 2:
-                    medicines.append(text)
-        
-        return medicines
-    except Exception as e:
-        raise RuntimeError(f"EasyOCR error:\n{str(e)}")
-
-
-def extract_with_azure(image_path: str, api_key: str) -> list[str]:
-    """Extract medicine names using Azure Computer Vision (FREE tier)."""
-    try:
-        import urllib.request
-        import urllib.error
-        import json
-    except ImportError:
-        raise RuntimeError("Missing required modules")
-    
-    try:
-        with open(image_path, "rb") as f:
-            image_data = f.read()
-        
-        # Azure endpoint (replace with your region if needed)
-        endpoint = "https://YOUR_REGION.api.cognitive.microsoft.com/vision/v3.2/ocr"
-        
-        req = urllib.request.Request(
-            endpoint + "?language=en",
-            data=image_data,
-            headers={
-                "Ocp-Apim-Subscription-Key": api_key,
-                "Content-Type": "application/octet-stream"
-            },
-            method="POST"
-        )
-        
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
-        
-        medicines = []
-        for region in result.get("regions", []):
-            for line in region.get("lines", []):
-                for word in line.get("words", []):
-                    text = word.get("text", "").strip(" -•*1234567890.)")
-                    if len(text) > 2:
-                        medicines.append(text)
-        
-        return medicines
-    except Exception as e:
-        raise RuntimeError(f"Azure error:\n{str(e)}")
-
-
-def extract_with_aws(image_path: str, aws_access_key: str, aws_secret_key: str) -> list[str]:
-    """Extract medicine names using AWS Rekognition (FREE tier for 12 months)."""
-    try:
-        import boto3
-    except ImportError:
-        raise RuntimeError(
-            "boto3 not installed.\n\n"
-            "Install with:\n"
-            "pip install boto3"
-        )
-    
-    try:
-        client = boto3.client(
-            'rekognition',
-            region_name='us-east-1',
-            aws_access_key_id=aws_access_key,
-            aws_secret_access_key=aws_secret_key
-        )
-        
-        with open(image_path, "rb") as f:
-            image_bytes = f.read()
-        
-        response = client.detect_text(Image={'Bytes': image_bytes})
-        
-        medicines = []
-        for detection in response.get('TextDetections', []):
-            if detection['Type'] == 'LINE':
-                text = detection['DetectedText'].strip(" -•*1234567890.)")
-                if len(text) > 2:
-                    medicines.append(text)
-        
-        return medicines
-    except Exception as e:
-        raise RuntimeError(f"AWS error:\n{str(e)}")
-
-
-def extract_medicines_from_image(image_path: str, method: str, api_key: str = None) -> list[str]:
-    """Main extraction function that delegates to chosen method."""
-    
-    if method == "tesseract_ocr":
-        return extract_with_tesseract(image_path)
-    elif method == "paddleocr":
-        return extract_with_paddleocr(image_path)
-    elif method == "easyocr":
-        return extract_with_easyocr(image_path)
-    elif method == "azure_free":
-        if not api_key:
-            raise RuntimeError("Azure API key required")
-        return extract_with_azure(image_path, api_key)
-    elif method == "aws_rekognition":
-        if not api_key:
-            raise RuntimeError("AWS credentials required")
-        return extract_with_aws(image_path, api_key, api_key)
-    elif method == "ibm_vision":
-        raise RuntimeError("IBM Vision support coming soon")
-    else:
-        raise RuntimeError(f"Unknown method: {method}")
-
-
-# ─────────────────────────────────────────────
-#  PRESCRIPTION DIALOG
-# ─────────────────────────────────────────────
-
-class PrescriptionDialog(tk.Toplevel):
-    """
-    Shows extracted medicine names as checkboxes.
-    User selects which ones to search and clicks 'Search Selected'.
-    """
-
-    def __init__(self, parent, medicines: list[str], theme: dict,
-                 on_search_callback):
-        super().__init__(parent)
-        self.title("📋  Prescription — Select Medicines to Search")
-        self.configure(bg=theme["BG"])
-        self.resizable(False, False)
-        self._t = theme
-        self._on_search = on_search_callback
-        self._vars = []
-
-        self.transient(parent)
-        self.grab_set()
-
-        self._build(medicines)
-
-        # Center on parent
-        self.update_idletasks()
-        pw, ph = parent.winfo_width(), parent.winfo_height()
-        px, py = parent.winfo_rootx(), parent.winfo_rooty()
-        w, h = self.winfo_width(), self.winfo_height()
-        self.geometry(f"+{px + (pw - w) // 2}+{py + (ph - h) // 2}")
-
-    def _build(self, medicines):
-        t = self._t
-
-        # ── Header ──
-        hdr = tk.Frame(self, bg=t["PANEL"], pady=14, padx=20)
-        hdr.pack(fill="x")
-        tk.Label(hdr, text="📋  Prescription Scan Results",
-                 bg=t["PANEL"], fg=t["ACCENT"],
-                 font=("Segoe UI", 14, "bold")).pack(anchor="w")
-        tk.Label(hdr,
-                 text="Select the medicines you want to look up:",
-                 bg=t["PANEL"], fg=t["MUTED"],
-                 font=("Segoe UI", 10)).pack(anchor="w", pady=(4, 0))
-
-        tk.Frame(self, bg=t["BORDER"], height=1).pack(fill="x")
-
-        # ── Scrollable checkbox area ──
-        container = tk.Frame(self, bg=t["BG"])
-        container.pack(fill="both", expand=True, padx=0, pady=0)
-
-        canvas = tk.Canvas(container, bg=t["BG"],
-                           highlightthickness=0, bd=0,
-                           width=380, height=min(300, len(medicines) * 42 + 20))
-        vsb = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=vsb.set)
-        vsb.pack(side="right", fill="y")
-        canvas.pack(side="left", fill="both", expand=True)
-
-        inner = tk.Frame(canvas, bg=t["BG"])
-        win = canvas.create_window((0, 0), window=inner, anchor="nw")
-
-        def _resize(e):
-            canvas.configure(scrollregion=canvas.bbox("all"))
-            canvas.itemconfig(win, width=canvas.winfo_width())
-
-        inner.bind("<Configure>", _resize)
-        canvas.bind("<Configure>", _resize)
-        canvas.bind_all("<MouseWheel>",
-                        lambda e: canvas.yview_scroll(
-                            int(-1 * (e.delta / 120)), "units"))
-
-        if not medicines:
-            tk.Label(inner,
-                     text="\n⚠️  No medicine names could be extracted.\n"
-                          "Try a clearer image.",
-                     bg=t["BG"], fg=t["DANGER"],
-                     font=("Segoe UI", 11),
-                     justify="center").pack(pady=20, padx=20)
-        else:
-            for i, name in enumerate(medicines):
-                var = tk.BooleanVar(value=True)
-                self._vars.append((var, name))
-                row_bg = t["ROW_EVEN"] if i % 2 == 0 else t["ROW_ODD"]
-                row = tk.Frame(inner, bg=row_bg, pady=6, padx=16)
-                row.pack(fill="x")
-
-                cb = tk.Checkbutton(
-                    row, variable=var,
-                    bg=row_bg,
-                    activebackground=row_bg,
-                    selectcolor=t["PANEL"],
-                    fg=t["TEXT"],
-                    activeforeground=t["TEXT"],
-                    cursor="hand2",
-                    highlightthickness=0,
-                    bd=0,
-                )
-                cb.pack(side="left")
-
-                tk.Label(row, text=name,
-                         bg=row_bg, fg=t["TEXT"],
-                         font=FONT_SMALL,
-                         anchor="w").pack(side="left", padx=(4, 0))
-
-        tk.Frame(self, bg=t["BORDER"], height=1).pack(fill="x")
-
-        # ── Buttons ──
-        btn_bar = tk.Frame(self, bg=t["BG"], pady=14, padx=20)
-        btn_bar.pack(fill="x")
-
-        # Select / Deselect all
-        def _toggle_all():
-            all_on = all(v.get() for v, _ in self._vars)
-            for v, _ in self._vars:
-                v.set(not all_on)
-
-        ttk.Button(btn_bar, text="Toggle All",
-                   style="Ghost.TButton",
-                   command=_toggle_all).pack(side="left")
-
-        ttk.Button(btn_bar, text="Cancel",
-                   style="Ghost.TButton",
-                   command=self.destroy).pack(side="right", padx=(8, 0))
-
-        ttk.Button(btn_bar, text="  🔍  Search Selected",
-                   style="Primary.TButton",
-                   command=self._confirm).pack(side="right")
-
-    def _confirm(self):
-        selected = [name for var, name in self._vars if var.get()]
-        self.destroy()
-        if selected:
-            self._on_search(selected)
-
-
-# ─────────────────────────────────────────────
 #  MAIN APPLICATION
 # ─────────────────────────────────────────────
 
@@ -533,8 +161,8 @@ class MedicineApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("MediSearch — Medicine Lookup")
-        self.geometry("1200x760")
-        self.minsize(950, 620)
+        self.geometry("1280x800")
+        self.minsize(1000, 650)
         self.resizable(True, True)
 
         # Active theme
@@ -545,14 +173,12 @@ class MedicineApp(tk.Tk):
 
         # State
         self.data = []
-        self.file_path   = tk.StringVar(value="No file loaded")
-        self.query_var   = tk.StringVar()
-        self.max_var     = tk.StringVar(value="10")
-        self.status_var  = tk.StringVar(value="Load a CSV file to begin.")
-        self._results    = []
-        self._shop_assignments = {}
-        self._ocr_method = None
-        self._api_key    = None
+        self.file_path = tk.StringVar(value="No file loaded")
+        self.query_var = tk.StringVar()
+        self.max_var = tk.StringVar(value="10")
+        self.status_var = tk.StringVar(value="Ready. Load a CSV file to begin.")
+        self._results = []
+        self._shop_assignments = {}   # medicine name -> assigned shop (session memory)
 
         self._build_styles()
         self._build_ui()
@@ -582,28 +208,13 @@ class MedicineApp(tk.Tk):
                          foreground=t["TEXT"],
                          font=FONT_LABEL)
 
-        style.configure("Muted.TLabel",
-                         background=t["BG"],
-                         foreground=t["MUTED"],
-                         font=FONT_SMALL)
-
-        style.configure("Accent.TLabel",
-                         background=t["BG"],
-                         foreground=t["ACCENT"],
-                         font=FONT_BOLD)
-
-        style.configure("Title.TLabel",
-                         background=t["BG"],
-                         foreground=t["TEXT"],
-                         font=FONT_TITLE)
-
         style.configure("Search.TEntry",
-                         fieldbackground=t["PANEL"],
+                         fieldbackground=t["BG"],
                          foreground=t["TEXT"],
                          insertcolor=t["TEXT"],
                          borderwidth=1,
                          relief="solid",
-                         padding=(10, 7))
+                         padding=(10, 8))
         style.map("Search.TEntry",
                    fieldbackground=[("focus", t["HEADER_BG"])],
                    bordercolor=[("focus", t["ACCENT"])])
@@ -612,28 +223,18 @@ class MedicineApp(tk.Tk):
                          background=t["ACCENT"],
                          foreground="#ffffff",
                          font=FONT_BOLD,
-                         padding=(16, 9),
+                         padding=(10, 10),
                          relief="flat")
         style.map("Primary.TButton",
                    background=[("active", t["ACCENT"]), ("pressed", t["ACCENT"])])
 
         style.configure("Ghost.TButton",
-                         background=t["PANEL"],
+                         background=t["BG"],
                          foreground=t["MUTED"],
                          font=FONT_SMALL,
-                         padding=(10, 7),
+                         padding=(10, 8),
                          relief="flat")
         style.map("Ghost.TButton",
-                   background=[("active", t["BORDER"])],
-                   foreground=[("active", t["TEXT"])])
-
-        style.configure("Prescription.TButton",
-                         background=t["TAG_BG"],
-                         foreground=t["ACCENT2"],
-                         font=("Segoe UI", 11, "bold"),
-                         padding=(12, 8),
-                         relief="flat")
-        style.map("Prescription.TButton",
                    background=[("active", t["BORDER"])],
                    foreground=[("active", t["TEXT"])])
 
@@ -641,7 +242,7 @@ class MedicineApp(tk.Tk):
                          background=t["TAG_BG"],
                          foreground=t["MUTED"],
                          font=("Segoe UI", 10),
-                         padding=(10, 5),
+                         padding=(10, 6),
                          relief="flat")
         style.map("Theme.TButton",
                    background=[("active", t["BORDER"])],
@@ -651,7 +252,7 @@ class MedicineApp(tk.Tk):
                          background=t["ACCENT"],
                          foreground="#ffffff",
                          font=("Segoe UI", 10, "bold"),
-                         padding=(10, 5),
+                         padding=(10, 6),
                          relief="flat")
 
         style.configure("Treeview",
@@ -659,14 +260,14 @@ class MedicineApp(tk.Tk):
                          fieldbackground=t["ROW_EVEN"],
                          foreground=t["TEXT"],
                          font=FONT_SMALL,
-                         rowheight=40,
+                         rowheight=45,
                          borderwidth=0)
         style.configure("Treeview.Heading",
                          background=t["HEADER_BG"],
                          foreground=t["MUTED"],
                          font=("Segoe UI", 11, "bold"),
                          relief="flat",
-                         padding=(8, 8))
+                         padding=(10, 12))
         style.map("Treeview",
                    background=[("selected", t["ROW_SEL"])],
                    foreground=[("selected", t["TEXT"])])
@@ -678,244 +279,153 @@ class MedicineApp(tk.Tk):
                          troughcolor=t["BG"],
                          arrowcolor=t["MUTED"],
                          borderwidth=0,
-                         width=10)
+                         width=12)
         style.configure("Horizontal.TScrollbar",
                          background=t["BORDER"],
                          troughcolor=t["BG"],
                          arrowcolor=t["MUTED"],
                          borderwidth=0,
-                         width=10)
+                         width=12)
 
         style.configure("TSpinbox",
-                         fieldbackground=t["PANEL"],
+                         fieldbackground=t["BG"],
                          foreground=t["TEXT"],
                          insertcolor=t["TEXT"],
                          arrowcolor=t["MUTED"],
-                         background=t["PANEL"],
+                         background=t["BG"],
                          borderwidth=1,
                          relief="solid",
-                         padding=(8, 7))
+                         padding=(8, 8))
 
-        style.configure("TSeparator", background=t["BORDER"])
-
-        style.configure("TNotebook",
-                         background=t["PANEL"],
-                         borderwidth=0,
-                         tabmargins=[0, 0, 0, 0])
-        style.configure("TNotebook.Tab",
-                         background=t["PANEL"],
-                         foreground=t["MUTED"],
-                         font=FONT_SMALL,
-                         padding=(14, 7))
-        style.map("TNotebook.Tab",
-                   background=[("selected", t["BG"])],
-                   foreground=[("selected", t["ACCENT"])])
-
-    # ── UI Layout ───────────────────────────
+    # ── UI Layout (COMPLETELY REDESIGNED TO SIDEBAR) ───────────────────────────
     def _build_ui(self):
         t = self._t
 
-        # ── Header bar ──
-        self._header = tk.Frame(self, bg=t["PANEL"], height=68)
-        self._header.pack(fill="x", side="top")
-        self._header.pack_propagate(False)
+        # ── SIDEBAR (Left Panel) ──
+        self._sidebar = tk.Frame(self, bg=t["PANEL"], width=300)
+        self._sidebar.pack(side="left", fill="y")
+        self._sidebar.pack_propagate(False) # Keep width fixed
 
-        tk.Label(self._header, text="💊", bg=t["PANEL"], fg=t["ACCENT"],
-                 font=("Segoe UI Emoji", 22)).pack(side="left", padx=(20, 6), pady=12)
-        tk.Label(self._header, text="MediSearch",
-                 bg=t["PANEL"], fg=t["TEXT"], font=FONT_TITLE).pack(side="left", pady=12)
-        tk.Label(self._header, text="  Medicine Lookup Tool",
-                 bg=t["PANEL"], fg=t["MUTED"], font=("Segoe UI", 13)).pack(side="left", pady=16)
+        # Header in Sidebar
+        header_frame = tk.Frame(self._sidebar, bg=t["PANEL"])
+        header_frame.pack(fill="x", pady=(30, 20), padx=20)
+        tk.Label(header_frame, text="💊 MediSearch", bg=t["PANEL"], fg=t["ACCENT"], font=FONT_TITLE).pack(anchor="w")
+        tk.Label(header_frame, text="Medicine Lookup Tool v1.0", bg=t["PANEL"], fg=t["MUTED"], font=FONT_SMALL).pack(anchor="w", pady=(2, 0))
 
-        tk.Label(self._header, text="v2.0", bg=t["TAG_BG"], fg=t["ACCENT"],
-                 font=FONT_MONO, padx=8, pady=2).pack(side="right", padx=20, pady=18)
+        tk.Frame(self._sidebar, bg=t["BORDER"], height=1).pack(fill="x", padx=20, pady=10)
 
-        # ── Theme switcher bar ──
-        self._theme_bar = tk.Frame(self, bg=t["BG"], pady=8, padx=20)
-        self._theme_bar.pack(fill="x")
-        tk.Label(self._theme_bar, text="THEME:", bg=t["BG"], fg=t["MUTED"],
-                 font=("Segoe UI", 9, "bold")).pack(side="left", padx=(0, 8))
+        # File Section
+        file_frame = tk.Frame(self._sidebar, bg=t["PANEL"])
+        file_frame.pack(fill="x", padx=20, pady=10)
+        tk.Label(file_frame, text="1. DATABASE", bg=t["PANEL"], fg=t["TEXT"], font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(0, 5))
+        
+        self._file_label = tk.Label(file_frame, textvariable=self.file_path, bg=t["BG"], fg=t["MUTED"], font=FONT_MONO, wraplength=250, anchor="w", justify="left", padx=10, pady=8)
+        self._file_label.pack(fill="x", pady=(0, 8))
+        
+        ttk.Button(file_frame, text="📁 Browse CSV...", style="Ghost.TButton", command=self._browse_file).pack(fill="x")
+
+        tk.Frame(self._sidebar, bg=t["BORDER"], height=1).pack(fill="x", padx=20, pady=15)
+
+        # Search Section
+        search_frame = tk.Frame(self._sidebar, bg=t["PANEL"])
+        search_frame.pack(fill="x", padx=20, pady=10)
+        tk.Label(search_frame, text="2. SEARCH MEDICINE", bg=t["PANEL"], fg=t["TEXT"], font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(0, 5))
+
+        self._search_entry = ttk.Entry(search_frame, textvariable=self.query_var, style="Search.TEntry", font=FONT_LABEL)
+        self._search_entry.pack(fill="x", pady=(0, 8))
+        self._search_entry.bind("<Return>", lambda e: self._do_search())
+
+        self._scan_btn = ttk.Button(search_frame, text="📸 Scan Prescription", style="Ghost.TButton", command=self._scan_prescription)
+        self._scan_btn.pack(fill="x", pady=(0, 15))
+
+        # Settings Section inside Search
+        max_frame = tk.Frame(search_frame, bg=t["PANEL"])
+        max_frame.pack(fill="x", pady=(0, 15))
+        tk.Label(max_frame, text="Max Results:", bg=t["PANEL"], fg=t["MUTED"], font=FONT_SMALL).pack(side="left")
+        ttk.Spinbox(max_frame, textvariable=self.max_var, from_=1, to=500, width=8, font=FONT_LABEL).pack(side="right")
+
+        # Action Buttons
+        ttk.Button(search_frame, text="🔍 Search", style="Primary.TButton", command=self._do_search).pack(fill="x", pady=(0, 8))
+        ttk.Button(search_frame, text="✖ Clear", style="Ghost.TButton", command=self._clear).pack(fill="x")
+
+        # Theme Switcher (Bottom of Sidebar)
+        theme_frame = tk.Frame(self._sidebar, bg=t["PANEL"])
+        theme_frame.pack(side="bottom", fill="x", padx=20, pady=20)
+        tk.Label(theme_frame, text="THEME", bg=t["PANEL"], fg=t["MUTED"], font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(0, 5))
+        
         self._theme_buttons = {}
         for name in THEMES:
             s = "ActiveTheme.TButton" if name == self._theme_name else "Theme.TButton"
-            btn = ttk.Button(self._theme_bar, text=name,
-                             style=s,
-                             command=lambda n=name: self._switch_theme(n))
-            btn.pack(side="left", padx=3)
+            btn = ttk.Button(theme_frame, text=name, style=s, command=lambda n=name: self._switch_theme(n))
+            btn.pack(fill="x", pady=2)
             self._theme_buttons[name] = btn
 
-        # thin accent line
-        self._accent_line = tk.Frame(self, bg=t["ACCENT"], height=2)
-        self._accent_line.pack(fill="x")
+        # Divider between Sidebar and Main Content
+        tk.Frame(self, bg=t["BORDER"], width=1).pack(side="left", fill="y")
 
-        # ── Control bar ──
-        self._ctrl = tk.Frame(self, bg=t["BG"], pady=16, padx=20)
-        self._ctrl.pack(fill="x")
+        # ── MAIN CONTENT AREA (Right Panel) ──
+        self._main_area = tk.Frame(self, bg=t["BG"])
+        self._main_area.pack(side="left", fill="both", expand=True)
 
-        # File picker
-        file_group = tk.Frame(self._ctrl, bg=t["BG"])
-        file_group.pack(side="left")
-        tk.Label(file_group, text="CSV FILE", bg=t["BG"], fg=t["MUTED"],
-                 font=("Segoe UI", 9, "bold")).pack(anchor="w")
-        file_row = tk.Frame(file_group, bg=t["BG"])
-        file_row.pack()
-        self._file_label = tk.Label(file_row,
-                                     textvariable=self.file_path,
-                                     bg=t["PANEL"], fg=t["MUTED"],
-                                     font=FONT_MONO,
-                                     padx=10, pady=7,
-                                     width=30,
-                                     anchor="w",
-                                     relief="flat")
-        self._file_label.pack(side="left")
-        ttk.Button(file_row, text="Browse…",
-                   style="Ghost.TButton",
-                   command=self._browse_file).pack(side="left", padx=(4, 0))
+        # Top Info Bar
+        top_bar = tk.Frame(self._main_area, bg=t["HEADER_BG"], height=50)
+        top_bar.pack(fill="x", side="top")
+        top_bar.pack_propagate(False)
+        
+        tk.Label(top_bar, textvariable=self.status_var, bg=t["HEADER_BG"], fg=t["TEXT"], font=FONT_SMALL).pack(side="left", padx=20)
+        self._count_label = tk.Label(top_bar, text="", bg=t["HEADER_BG"], fg=t["ACCENT2"], font=FONT_BOLD)
+        self._count_label.pack(side="right", padx=20)
 
-        tk.Frame(self._ctrl, bg=t["BORDER"], width=1).pack(side="left", fill="y", padx=20)
+        tk.Frame(self._main_area, bg=t["BORDER"], height=1).pack(fill="x")
 
-        # Search
-        search_group = tk.Frame(self._ctrl, bg=t["BG"])
-        search_group.pack(side="left")
-        tk.Label(search_group, text="SEARCH", bg=t["BG"], fg=t["MUTED"],
-                 font=("Segoe UI", 9, "bold")).pack(anchor="w")
-        search_row = tk.Frame(search_group, bg=t["BG"])
-        search_row.pack()
-        self._search_entry = ttk.Entry(search_row,
-                                        textvariable=self.query_var,
-                                        style="Search.TEntry",
-                                        width=28,
-                                        font=FONT_LABEL)
-        self._search_entry.pack(side="left")
-        self._search_entry.bind("<Return>", lambda e: self._do_search())
+        # Body Split (Treeview & Details)
+        body_split = tk.Frame(self._main_area, bg=t["BG"])
+        body_split.pack(fill="both", expand=True)
 
-        tk.Frame(self._ctrl, bg=t["BG"], width=8).pack(side="left")
+        # Details Panel (Right side of Main Area)
+        self._right = tk.Frame(body_split, bg=t["PANEL"], width=350)
+        self._right.pack(side="right", fill="y")
+        self._right.pack_propagate(False)
+        tk.Frame(body_split, bg=t["BORDER"], width=1).pack(side="right", fill="y")
+        self._build_detail_panel(self._right)
 
-        # Max results
-        max_group = tk.Frame(self._ctrl, bg=t["BG"])
-        max_group.pack(side="left")
-        tk.Label(max_group, text="MAX RESULTS", bg=t["BG"], fg=t["MUTED"],
-                 font=("Segoe UI", 9, "bold")).pack(anchor="w")
-        ttk.Spinbox(max_group,
-                    textvariable=self.max_var,
-                    from_=1, to=500,
-                    width=6,
-                    font=FONT_LABEL).pack()
-
-        tk.Frame(self._ctrl, bg=t["BG"], width=12).pack(side="left")
-
-        # Search button
-        btn_group = tk.Frame(self._ctrl, bg=t["BG"])
-        btn_group.pack(side="left")
-        tk.Label(btn_group, text=" ", bg=t["BG"], font=("Segoe UI", 9)).pack()
-        ttk.Button(btn_group,
-                   text="  🔍  Search",
-                   style="Primary.TButton",
-                   command=self._do_search).pack()
-
-        # Clear button
-        clear_group = tk.Frame(self._ctrl, bg=t["BG"])
-        clear_group.pack(side="left", padx=(6, 0))
-        tk.Label(clear_group, text=" ", bg=t["BG"], font=("Segoe UI", 9)).pack()
-        ttk.Button(clear_group,
-                   text="Clear",
-                   style="Ghost.TButton",
-                   command=self._clear).pack()
-
-        # ── Prescription Upload button (right-aligned) ──
-        rx_group = tk.Frame(self._ctrl, bg=t["BG"])
-        rx_group.pack(side="right", padx=(0, 4))
-        tk.Label(rx_group, text="PRESCRIPTION", bg=t["BG"], fg=t["MUTED"],
-                 font=("Segoe UI", 9, "bold")).pack(anchor="center")
-        ttk.Button(rx_group,
-                   text="  📋  Upload & Scan",
-                   style="Prescription.TButton",
-                   command=self._upload_prescription).pack()
-
-        # Result count badge
-        self._count_label = tk.Label(self._ctrl,
-                                      text="",
-                                      bg=t["BG"], fg=t["ACCENT2"],
-                                      font=FONT_BOLD)
-        self._count_label.pack(side="right", padx=10)
-
-        # thin divider
-        self._divider1 = tk.Frame(self, bg=t["BORDER"], height=1)
-        self._divider1.pack(fill="x")
-
-        # ── Main body ──
-        self._body = tk.Frame(self, bg=t["BG"])
-        self._body.pack(fill="both", expand=True)
-
-        # Left: results table
-        left = tk.Frame(self._body, bg=t["BG"])
-        left.pack(side="left", fill="both", expand=True)
-
-        cols_bar = tk.Frame(left, bg=t["BG"], pady=6, padx=14)
-        cols_bar.pack(fill="x")
-        tk.Label(cols_bar, text="RESULTS", bg=t["BG"], fg=t["MUTED"],
-                 font=("Segoe UI", 9, "bold")).pack(side="left")
-
-        tree_frame = tk.Frame(left, bg=t["BG"])
-        tree_frame.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+        # Treeview Section (Left side of Main Area)
+        tree_container = tk.Frame(body_split, bg=t["BG"])
+        tree_container.pack(side="left", fill="both", expand=True, padx=20, pady=20)
 
         cols = ("name", "composition", "price", "manufacturer")
-        self.tree = ttk.Treeview(tree_frame,
-                                  columns=cols,
-                                  show="headings",
-                                  selectmode="browse")
+        self.tree = ttk.Treeview(tree_container, columns=cols, show="headings", selectmode="browse")
 
         self.tree.heading("name",         text="Product Name")
         self.tree.heading("composition",  text="Composition")
         self.tree.heading("price",        text="Price")
         self.tree.heading("manufacturer", text="Manufacturer")
 
-        self.tree.column("name",         width=220, anchor="w", stretch=True)
-        self.tree.column("composition",  width=220, anchor="w", stretch=True)
-        self.tree.column("price",        width=80,  anchor="center", stretch=False)
-        self.tree.column("manufacturer", width=150, anchor="w", stretch=True)
+        self.tree.column("name",         width=250, anchor="w", stretch=True)
+        self.tree.column("composition",  width=250, anchor="w", stretch=True)
+        self.tree.column("price",        width=100, anchor="center", stretch=False)
+        self.tree.column("manufacturer", width=180, anchor="w", stretch=True)
 
-        vsb = ttk.Scrollbar(tree_frame, orient="vertical",   command=self.tree.yview)
-        hsb = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.tree.xview)
+        vsb = ttk.Scrollbar(tree_container, orient="vertical",   command=self.tree.yview)
+        hsb = ttk.Scrollbar(tree_container, orient="horizontal", command=self.tree.xview)
         self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
 
         self.tree.grid(row=0, column=0, sticky="nsew")
         vsb.grid(row=0, column=1, sticky="ns")
         hsb.grid(row=1, column=0, sticky="ew")
-        tree_frame.rowconfigure(0, weight=1)
-        tree_frame.columnconfigure(0, weight=1)
+        tree_container.rowconfigure(0, weight=1)
+        tree_container.columnconfigure(0, weight=1)
 
         self.tree.tag_configure("odd",  background=t["ROW_ODD"])
         self.tree.tag_configure("even", background=t["ROW_EVEN"])
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
 
-        # Right: detail panel
-        self._right_border = tk.Frame(self._body, bg=t["BORDER"], width=1)
-        self._right_border.pack(side="left", fill="y")
-
-        self._right = tk.Frame(self._body, bg=t["PANEL"], width=340)
-        self._right.pack(side="left", fill="y")
-        self._right.pack_propagate(False)
-
-        self._build_detail_panel(self._right)
-
-        # ── Status bar ──
-        self._status_border = tk.Frame(self, bg=t["BORDER"], height=1)
-        self._status_border.pack(fill="x")
-        self._status_bar = tk.Frame(self, bg=t["STATUS_BG"], height=28)
-        self._status_bar.pack(fill="x", side="bottom")
-        self._status_bar.pack_propagate(False)
-        tk.Label(self._status_bar, textvariable=self.status_var,
-                 bg=t["STATUS_BG"], fg=t["MUTED"],
-                 font=FONT_MONO,
-                 anchor="w", padx=14).pack(fill="x", side="left")
 
     def _build_detail_panel(self, parent):
         t = self._t
-        top = tk.Frame(parent, bg=t["PANEL"], pady=14, padx=16)
+        top = tk.Frame(parent, bg=t["PANEL"], pady=18, padx=20)
         top.pack(fill="x")
-        tk.Label(top, text="DETAILS", bg=t["PANEL"], fg=t["MUTED"],
-                 font=("Segoe UI", 9, "bold")).pack(anchor="w")
+        tk.Label(top, text="MEDICINE DETAILS", bg=t["PANEL"], fg=t["TEXT"], font=("Segoe UI", 11, "bold")).pack(anchor="w")
 
         tk.Frame(parent, bg=t["BORDER"], height=1).pack(fill="x")
 
@@ -926,8 +436,7 @@ class MedicineApp(tk.Tk):
         canvas.pack(side="left", fill="both", expand=True)
 
         self._detail_inner = tk.Frame(canvas, bg=t["PANEL"])
-        self._canvas_window = canvas.create_window(
-            (0, 0), window=self._detail_inner, anchor="nw")
+        self._canvas_window = canvas.create_window((0, 0), window=self._detail_inner, anchor="nw")
 
         def on_configure(e):
             canvas.configure(scrollregion=canvas.bbox("all"))
@@ -947,7 +456,7 @@ class MedicineApp(tk.Tk):
         for w in self._detail_inner.winfo_children():
             w.destroy()
         tk.Label(self._detail_inner,
-                 text="\n\n\n\nSelect a result\nto see details.",
+                 text="\n\n\n\n\n🔍\n\nSelect a medicine from the\nlist to view its details.",
                  bg=t["PANEL"], fg=t["MUTED"],
                  font=("Segoe UI", 12),
                  justify="center").pack(fill="both", expand=True, pady=40)
@@ -957,12 +466,12 @@ class MedicineApp(tk.Tk):
         for w in self._detail_inner.winfo_children():
             w.destroy()
 
-        pad = dict(padx=16, anchor="w")
+        pad = dict(padx=20, anchor="w")
 
         def section(label, value):
             tk.Label(self._detail_inner, text=label,
                      bg=t["PANEL"], fg=t["MUTED"],
-                     font=("Segoe UI", 9, "bold"), **pad).pack(fill="x", pady=(12, 2))
+                     font=("Segoe UI", 9, "bold"), **pad).pack(fill="x", pady=(15, 4))
             val = value.strip() if value else "—"
             tk.Label(self._detail_inner, text=val,
                      bg=t["PANEL"], fg=t["TEXT"],
@@ -970,27 +479,27 @@ class MedicineApp(tk.Tk):
                      wraplength=290,
                      justify="left", **pad).pack(fill="x")
             tk.Frame(self._detail_inner, bg=t["BORDER"], height=1).pack(
-                fill="x", padx=16, pady=(10, 0))
+                fill="x", padx=20, pady=(12, 0))
 
         # Medicine name
         tk.Label(self._detail_inner,
                  text=med.get('product_name', '—'),
                  bg=t["PANEL"], fg=t["ACCENT"],
-                 font=("Segoe UI", 13, "bold"),
+                 font=("Segoe UI", 16, "bold"),
                  wraplength=290,
                  justify="left",
-                 padx=16, anchor="w").pack(fill="x", pady=(16, 4))
+                 padx=20, anchor="w").pack(fill="x", pady=(20, 8))
 
         # Price badge
         price = med.get('product_price', '—').strip()
-        pk = tk.Frame(self._detail_inner, bg=t["PANEL"], padx=16)
-        pk.pack(fill="x", pady=(0, 8))
+        pk = tk.Frame(self._detail_inner, bg=t["PANEL"], padx=20)
+        pk.pack(fill="x", pady=(0, 12))
         tk.Label(pk, text=f"Rs. {price}" if price else "Price N/A",
                  bg=t["TAG_BG"], fg=t["ACCENT2"],
                  font=FONT_BOLD,
-                 padx=10, pady=3).pack(side="left")
+                 padx=12, pady=6).pack(side="left")
 
-        tk.Frame(self._detail_inner, bg=t["BORDER"], height=1).pack(fill="x", padx=16)
+        tk.Frame(self._detail_inner, bg=t["BORDER"], height=1).pack(fill="x", padx=20)
 
         section("SALT COMPOSITION",  med.get('salt_composition', ''))
         section("MANUFACTURER",      med.get('product_manufactured', ''))
@@ -1001,23 +510,23 @@ class MedicineApp(tk.Tk):
         tk.Label(self._detail_inner, text="AVAILABLE AT",
                  bg=t["PANEL"], fg=t["MUTED"],
                  font=("Segoe UI", 9, "bold"),
-                 padx=16, anchor="w").pack(fill="x", pady=(12, 2))
+                 padx=20, anchor="w").pack(fill="x", pady=(15, 4))
 
         if shop:
-            shop_frame = tk.Frame(self._detail_inner, bg=t["PANEL"], padx=16)
-            shop_frame.pack(fill="x", pady=(2, 16))
+            shop_frame = tk.Frame(self._detail_inner, bg=t["PANEL"], padx=20)
+            shop_frame.pack(fill="x", pady=(2, 20))
 
             tk.Label(shop_frame,
                      text=f"🏪  {shop['name']}",
-                     bg=t["PANEL"], fg=t["ACCENT"],
+                     bg=t["PANEL"], fg=t["TEXT"],
                      font=FONT_BOLD).pack(anchor="w")
 
             link = tk.Label(shop_frame,
                             text="📍 View on Google Maps",
-                            bg=t["PANEL"], fg=t["ACCENT2"],
+                            bg=t["PANEL"], fg=t["ACCENT"],
                             font=FONT_SMALL,
                             cursor="hand2")
-            link.pack(anchor="w", pady=(6, 0))
+            link.pack(anchor="w", pady=(8, 0))
             link.bind("<Button-1>", lambda e, url=shop['url']: webbrowser.open(url))
 
     # ── Theme Switching ──────────────────────
@@ -1034,6 +543,67 @@ class MedicineApp(tk.Tk):
         self.status_var.set("Theme changed to: " + name)
 
     # ── Actions ─────────────────────────────
+    
+    # --- NEW MULTI-THREADED SCANNER ---
+    def _scan_prescription(self):
+        # FIXED: Mac-compatible filetypes format
+        path = filedialog.askopenfilename(
+            title="Select Prescription Image",
+            filetypes=[
+                ("PNG Images", "*.png"),
+                ("JPEG Images", "*.jpg"),
+                ("JPEG Images", "*.jpeg"),
+                ("All files", "*.*")
+            ]
+        )
+        if not path:
+            return
+
+        # Update UI to show we are working
+        self.status_var.set("Scanning prescription with AI... Please wait.")
+        self._scan_btn.config(state="disabled") # Prevent double-clicking
+        self.update_idletasks()
+
+        # Start a background thread to prevent Tkinter from freezing
+        threading.Thread(target=self._process_scan_thread, args=(path,), daemon=True).start()
+
+    def _process_scan_thread(self, path):
+        """This runs in the background so the UI doesn't freeze"""
+        try:
+            img = PIL.Image.open(path)
+            prompt = "Read this handwritten prescription. Extract ONLY the name of the primary medicine. Do not include dosages, instructions, or any extra text. Just the medicine name."
+            
+            # Using the new Google GenAI SDK syntax
+            response = client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=[prompt, img]
+            )
+            med_name = response.text.strip()
+            
+            # Use 'self.after' to safely send the result back to the main UI thread
+            self.after(0, self._on_scan_complete, med_name, None)
+
+        except Exception as e:
+            # Send error back to main thread
+            self.after(0, self._on_scan_complete, None, str(e))
+
+    def _on_scan_complete(self, med_name, error_msg):
+        """This runs back on the main UI thread to update the screen"""
+        self._scan_btn.config(state="normal") # Re-enable the button
+        
+        if error_msg:
+            messagebox.showerror("OCR Error", f"An error occurred:\n{error_msg}")
+            self.status_var.set("OCR Error.")
+            return
+
+        if med_name:
+            self.query_var.set(med_name)
+            self.status_var.set(f"Extracted from image: {med_name}")
+            self._do_search()
+        else:
+            messagebox.showinfo("OCR Result", "Could not confidently detect a medicine name.")
+            self.status_var.set("OCR failed to find medicine.")
+
     def _browse_file(self):
         path = filedialog.askopenfilename(
             title="Select medicine CSV file",
@@ -1076,16 +646,14 @@ class MedicineApp(tk.Tk):
             return
 
         results = search_medicine(self.data, query, max_r)
-        self._populate_tree(results, query)
 
-    def _populate_tree(self, results, label=""):
-        """Fill the results treeview with a list of medicine rows."""
         for item in self.tree.get_children():
             self.tree.delete(item)
+
         self._show_empty_detail()
 
         if not results:
-            self.status_var.set(f'No results found for "{label}"')
+            self.status_var.set(f'No results found for "{query}"')
             self._count_label.config(text="0 results")
             return
 
@@ -1102,9 +670,7 @@ class MedicineApp(tk.Tk):
                               ))
 
         self._results = results
-        self.status_var.set(
-            f'Found {len(results):,} result(s)' +
-            (f' for "{label}"' if label else ''))
+        self.status_var.set(f'Found {len(results):,} result(s) for "{query}"')
         self._count_label.config(text=f"{len(results)} result(s)")
 
     def _clear(self):
@@ -1129,221 +695,6 @@ class MedicineApp(tk.Tk):
             self._shop_assignments[med_key] = random.choice(SHOPS)
 
         self._show_detail(med, self._shop_assignments[med_key])
-
-    # ── Prescription Upload ──────────────────
-    def _upload_prescription(self):
-        """Open an image file, scan it with chosen OCR method."""
-        if not self.data:
-            messagebox.showwarning(
-                "No CSV loaded",
-                "Please load a medicine CSV file before scanning a prescription.")
-            return
-
-        # Default to PaddleOCR if not set
-        if not self._ocr_method:
-            self._ocr_method = "paddleocr"
-
-        # Pick image
-        path = filedialog.askopenfilename(
-            title="Select prescription image",
-            filetypes=[
-                ("Image files", "*.jpg *.jpeg *.png *.webp *.gif"),
-                ("All files", "*.*"),
-            ])
-        if not path:
-            return
-
-        # Check if this is first scan (need to download models)
-        is_first_scan = self._check_first_scan(self._ocr_method)
-        
-        if is_first_scan and self._ocr_method in ["paddleocr", "easyocr"]:
-            # Show progress dialog for model download
-            self._show_download_progress(self._ocr_method, path)
-        else:
-            # Standard scan without model download
-            self._perform_scan(path)
-
-    def _check_first_scan(self, method):
-        """Check if models are already downloaded for this method."""
-        if method == "paddleocr":
-            import os
-            paddle_cache = os.path.expanduser("~/.paddleocr")
-            return not os.path.exists(paddle_cache)
-        elif method == "easyocr":
-            import os
-            easy_cache = os.path.expanduser("~/.EasyOCR")
-            return not os.path.exists(easy_cache)
-        return False
-
-    def _show_download_progress(self, method, image_path):
-        """Show progress dialog during first-time model download."""
-        t = self._t
-        
-        progress_window = tk.Toplevel(self)
-        progress_window.title("Downloading OCR Models")
-        progress_window.geometry("400x200")
-        progress_window.configure(bg=t["BG"])
-        progress_window.resizable(False, False)
-        
-        progress_window.transient(self)
-        progress_window.grab_set()
-        
-        # Header
-        header = tk.Frame(progress_window, bg=t["PANEL"], pady=12, padx=20)
-        header.pack(fill="x")
-        tk.Label(header, text="⏳ First-Time Setup",
-                 bg=t["PANEL"], fg=t["ACCENT"],
-                 font=("Segoe UI", 13, "bold")).pack(anchor="w")
-        tk.Label(header, text=f"Downloading {method.upper()} models (~500MB)…",
-                 bg=t["PANEL"], fg=t["MUTED"],
-                 font=("Segoe UI", 10)).pack(anchor="w", pady=(4, 0))
-        
-        tk.Frame(progress_window, bg=t["BORDER"], height=1).pack(fill="x")
-        
-        # Progress info
-        content = tk.Frame(progress_window, bg=t["BG"], pady=20, padx=20)
-        content.pack(fill="both", expand=True)
-        
-        tk.Label(content, text="This happens only once per method.",
-                 bg=t["BG"], fg=t["MUTED"],
-                 font=("Segoe UI", 10)).pack(anchor="w", pady=(0, 16))
-        
-        # Progress bar
-        tk.Label(content, text="Progress:",
-                 bg=t["BG"], fg=t["TEXT"],
-                 font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(0, 6))
-        
-        progress_frame = tk.Frame(content, bg=t["PANEL"], height=20, width=360)
-        progress_frame.pack(fill="x", pady=(0, 12))
-        progress_frame.pack_propagate(False)
-        
-        progress_fill = tk.Frame(progress_frame, bg=t["ACCENT"], height=20)
-        progress_fill.pack(side="left", fill="y")
-        
-        progress_label = tk.Label(content, text="Initializing…",
-                                   bg=t["BG"], fg=t["ACCENT2"],
-                                   font=("Segoe UI", 10, "bold"))
-        progress_label.pack(anchor="w")
-        
-        tk.Label(content, text="Connected to internet?\n"
-                             "Do not close this window.",
-                 bg=t["BG"], fg=t["MUTED"],
-                 font=("Segoe UI", 9),
-                 justify="left").pack(anchor="w", pady=(16, 0))
-        
-        progress_window.update_idletasks()
-        
-        # Simulate download with progress updates
-        import threading
-        
-        def download_with_progress():
-            try:
-                # Stage 1: Initialize (20%)
-                progress_fill.pack_propagate(False)
-                progress_fill.configure(width=int(360 * 0.2))
-                progress_label.config(text="20% - Initializing models…")
-                progress_window.update()
-                self.after(800)
-                
-                # Stage 2: Download (60%)
-                progress_fill.configure(width=int(360 * 0.6))
-                progress_label.config(text="60% - Downloading model files…")
-                progress_window.update()
-                self.after(1600)
-                
-                # Stage 3: Extracting (90%)
-                progress_fill.configure(width=int(360 * 0.9))
-                progress_label.config(text="90% - Extracting files…")
-                progress_window.update()
-                self.after(600)
-                
-                # Stage 4: Complete (100%)
-                progress_fill.configure(width=360)
-                progress_label.config(text="100% - Ready to scan!")
-                progress_window.update()
-                self.after(500)
-                
-                # Now perform the actual scan
-                progress_window.destroy()
-                self._perform_scan(image_path)
-                
-            except Exception as e:
-                progress_window.destroy()
-                messagebox.showerror(
-                    "Download Error",
-                    f"Failed during model download:\n{e}")
-                self.status_var.set("Download failed.")
-        
-        # Run download in thread to keep UI responsive
-        thread = threading.Thread(target=download_with_progress, daemon=True)
-        thread.start()
-
-    def _perform_scan(self, image_path):
-        """Perform the actual prescription scan."""
-        t = self._t
-        
-        # Show scanning status
-        self.status_var.set("🔍  Scanning prescription image…")
-        self.update_idletasks()
-
-        try:
-            medicines = extract_medicines_from_image(image_path, self._ocr_method, self._api_key)
-        except RuntimeError as e:
-            messagebox.showerror(
-                "Scan Failed",
-                f"Could not extract medicines from the image.\n\nError:\n{e}")
-            self.status_var.set("Prescription scan failed.")
-            return
-
-        img_name = Path(image_path).name
-        count = len(medicines)
-        self.status_var.set(
-            f"✅  Found {count} medicine(s) in '{img_name}' — choose what to search.")
-
-        # Open dialog; on confirm, do a batch search
-        PrescriptionDialog(
-            parent=self,
-            medicines=medicines,
-            theme=self._t,
-            on_search_callback=self._search_from_prescription,
-        )
-
-    def _search_from_prescription(self, selected_names: list[str]):
-        """
-        Search the CSV for each selected medicine name and merge all results
-        into one combined results list, de-duplicated by product_name.
-        """
-        try:
-            max_r = int(self.max_var.get())
-            if max_r <= 0:
-                max_r = 10
-        except ValueError:
-            max_r = 10
-
-        seen_names = set()
-        combined = []
-
-        for name in selected_names:
-            hits = search_medicine(self.data, name, max_r)
-            for med in hits:
-                key = med.get('product_name', '').lower()
-                if key not in seen_names:
-                    seen_names.add(key)
-                    combined.append(med)
-
-        label = ", ".join(selected_names[:3])
-        if len(selected_names) > 3:
-            label += f" +{len(selected_names) - 3} more"
-
-        self._populate_tree(combined, label)
-
-        if combined:
-            self.status_var.set(
-                f"📋  Prescription search: {len(combined)} result(s) "
-                f"for {len(selected_names)} medicine(s) — {label}")
-        else:
-            self.status_var.set(
-                f"📋  No matches found in the database for the scanned medicines.")
 
 
 # ─────────────────────────────────────────────
